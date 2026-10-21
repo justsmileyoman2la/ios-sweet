@@ -12,10 +12,10 @@ index 6630131..abd212f 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/joyeuse_touch.c b/bsd/dev/joyeuse_touch.c
 new file mode 100644
-index 0000000..6da3d84
+index 0000000..b6d7177
 --- /dev/null
 +++ b/bsd/dev/joyeuse_touch.c
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,483 @@
 +/*
 + * JOYEUSE (Redmi Note 9 Pro, SM7125) FocalTech FT8756 touch over GENI SPI.
 + *
@@ -321,8 +321,9 @@ index 0000000..6da3d84
 +	buf[6] = 0u;
 +
 +	for (unsigned attempt = 0; attempt < JT_FT_RETRY; ++attempt) {
++		int err;
 +		memset(rx, 0, sizeof(rx));
-+		int err = jt_spi_xfer(buf, rx, n);
++		err = jt_spi_xfer(buf, rx, n);
 +		if (err) {
 +			continue;
 +		}
@@ -364,13 +365,20 @@ index 0000000..6da3d84
 +	if (jt_ft_read(JT_FT_REG_REPORT, pt, sizeof(pt)) != 0) {
 +		return;
 +	}
-+	for (unsigned i = 0; i < 6; ++i) {
-+		if (pt[i] != 0xefu && pt[i] != 0xffu) {
-+			break;
++	{
++		/* The chip flags download mode with 0xEF/0xFF in the first six
++		 * bytes of the report; only then is the firmware missing. */
++		bool download = true;
++		for (unsigned i = 0; i < 6; ++i) {
++			if (pt[i] != 0xefu && pt[i] != 0xffu) {
++				download = false;
++				break;
++			}
 +		}
-+		/* Chip is in download/recover mode: firmware upload is missing. */
-+		printf("JOYEUSE TOUCH: report carries download status\n");
-+		return;
++		if (download) {
++			printf("JOYEUSE TOUCH: report carries download status\n");
++			return;
++		}
 +	}
 +	for (unsigned i = 0; i < JT_FT_MAX_FINGERS; ++i) {
 +		unsigned base = 6u * i;
@@ -440,17 +448,28 @@ index 0000000..6da3d84
 +		return;
 +	}
 +
-+	/* Touch reset: gpio8 high releases the controller, low holds it. */
++	/* Touch reset and the start command, in the order the phone's own
++	 * Linux driver uses: reset low 1 ms, reset high 200 ms, write
++	 * 0x55/0xAA, wait 15 ms, then read the chip id (0x87 0x56). */
 +	jt_gpio(JT_GPIO_RESET, 0, 3, 3, true);
 +	jt_gpio(JT_GPIO_IRQ, 0, 3, 3, false);
-+	jt_wait(10);
++	jt_wr(jt.gpio, JT_GPIO_IO(JT_GPIO_RESET), 0u); /* assert reset */
++	jt_wait(1);
 +	jt_wr(jt.gpio, JT_GPIO_IO(JT_GPIO_RESET), 1u); /* release reset */
-+	jt_wait(300);
++	jt_wait(200);
++	{
++		uint8_t start[1];
++		int err;
++		start[0] = 0xaau;
++		err = jt_ft_write(0x55u, start, sizeof(start));
++		printf("JOYEUSE TOUCH: start cmd err=%d\n", err);
++	}
++	jt_wait(15);
 +
 +	if (jt_ft_read(JT_FT_REG_ID, id, sizeof(id)) == 0) {
-+		printf("JOYEUSE TOUCH: chip id %02x:%02x irq=%#x\n",
++		printf("JOYEUSE TOUCH: chip id %02x:%02x (want 87:56) irq=%#x\n",
 +		    id[0], id[1], jt.irq_status);
-+		jt.probed = true;
++		jt.probed = (id[0] == 0x87u && id[1] == 0x56u);
 +	} else {
 +		printf("JOYEUSE TOUCH: chip not answering (irq=%#x status=%#x)\n",
 +		    jt.irq_status, jt_rd(jt.spi, JT_SE_STATUS));
