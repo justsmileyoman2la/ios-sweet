@@ -12,10 +12,10 @@ index 6630131..abd212f 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/joyeuse_touch.c b/bsd/dev/joyeuse_touch.c
 new file mode 100644
-index 0000000..2dda0b6
+index 0000000..f69b819
 --- /dev/null
 +++ b/bsd/dev/joyeuse_touch.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,485 @@
 +/*
 + * JOYEUSE (Redmi Note 9 Pro, SM7125) FocalTech FT8756 touch over GENI SPI.
 + *
@@ -323,6 +323,7 @@ index 0000000..2dda0b6
 +	for (unsigned attempt = 0; attempt < JT_FT_RETRY; ++attempt) {
 +		int err;
 +		uint16_t crc;
++		uint16_t got;
 +		memset(rx, 0, sizeof(rx));
 +		err = jt_spi_xfer(buf, rx, n);
 +		if (err) {
@@ -342,7 +343,7 @@ index 0000000..2dda0b6
 +				    (uint16_t)(crc >> 1);
 +			}
 +		}
-+		uint16_t got = (uint16_t)((rx[7 + len] << 8) | rx[6 + len]);
++		got = (uint16_t)((rx[7 + len] << 8) | rx[6 + len]);
 +		if (crc != got) {
 +			printf("JOYEUSE TOUCH: crc %04x != %04x\n", crc, got);
 +			delay(1);
