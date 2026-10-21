@@ -1,0 +1,502 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..abd212f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/joyeuse_touch.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/joyeuse_touch.c b/bsd/dev/joyeuse_touch.c
+new file mode 100644
+index 0000000..6da3d84
+--- /dev/null
++++ b/bsd/dev/joyeuse_touch.c
+@@ -0,0 +1,464 @@
++/*
++ * JOYEUSE (Redmi Note 9 Pro, SM7125) FocalTech FT8756 touch over GENI SPI.
++ *
++ * The upstream sweet driver (bsd/dev/sweet_touch.c) speaks I2C on GENI SE7.
++ * joyeuse wires the controller to SPI11 (QUPv3 wrap2 S3) instead, so this
++ * driver adds a GENI SPI transport and the FT8756 wire protocol taken from
++ * the phone's own Linux driver (drivers/input/touchscreen/ft8756.c):
++ *
++ *   write: [cmd][0x00][len_hi][len_lo][0][0][0][payload...]
++ *   read:  [cmd][0xa0][len_hi][len_lo][0][0][0] -> rx[7..] payload + CRC16
++ *
++ * The chip needs its firmware (focaltech_ts_fw_huaxing.bin) uploaded through
++ * its ROM boot path; that is not implemented yet, so the driver logs what it
++ * sees and keeps polling. Boot args: joyeusetouch=0 disables, joyeusetouchdelay=N
++ * waits N seconds before the first probe, joyeusetouchprobe=1 probes only.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void joyeuse_touch_init(void);
++
++/* Hardware: joyeuse (SM7125 / ATOLL) */
++#define JT_SPI_PA       0x0a94000u  /* GENI SPI11, 0x4000, IRQ GIC SPI 358 */
++#define JT_TLMM_PA      0x0f100000u  /* main TLMM (eliza.dtsi pinctrl@f100000) */
++#define JT_GCC_PA       0x00100000u
++#define JT_RCG          0x1e3c8u     /* GCC RCG of QUPv3 wrap2 S3 (our SE) */
++#define JT_GPIO_RESET   8u           /* tlmm: reset, active high */
++#define JT_GPIO_IRQ     9u           /* tlmm: interrupt, falling edge */
++
++/* GENI SE registers (QUPv3 layout) */
++#define JT_SE_STATUS     0x040u
++#define JT_SE_SER_M_CLK  0x048u
++#define JT_SE_FW         0x068u
++#define JT_SE_CLK_SEL    0x07cu
++#define JT_SE_CPHA       0x224u
++#define JT_SE_CPOL       0x230u
++#define JT_SE_WORD_LEN   0x268u
++#define JT_SE_TX_LEN     0x26cu
++#define JT_SE_RX_LEN     0x270u
++#define JT_SE_SLAVE_EN   0x2bcu
++#define JT_SE_CMD        0x600u
++#define JT_SE_CTRL       0x604u
++#define JT_SE_IRQ        0x610u
++#define JT_SE_IRQ_EN     0x614u
++#define JT_SE_IRQ_CLR    0x618u
++#define JT_SE_TX         0x700u
++#define JT_SE_RX         0x780u
++#define JT_SE_TX_COUNT   0x800u
++#define JT_SE_RX_COUNT   0x804u
++#define JT_SE_IOS        0x908u
++
++/* GENI status bits */
++#define JT_SE_BUSY       0x1u
++#define JT_SE_DONE       (1u << 0)
++#define JT_SE_NACK       (1u << 10)
++#define JT_SE_ERRORS     (0x0eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++    (1u << 16) | (1u << 17) | (1u << 18))
++#define JT_SE_EVENTS     (JT_SE_DONE | JT_SE_ERRORS | (1u << 5) | (1u << 26) | \
++    (1u << 27) | (1u << 28))
++
++/* FT8756 protocol */
++#define JT_FT_WRITE_CMD   0x00u
++#define JT_FT_READ_CMD    0xa0u  /* 0x80 | 0x20 (CRC enable) */
++#define JT_FT_REG_REPORT  0x01u
++#define JT_FT_REG_ID      0x90u
++#define JT_FT_REPORT_LEN  62u
++#define JT_FT_MAX_FINGERS 10u
++#define JT_FT_RETRY       3u
++#define JT_CS_DELAY_US    150u
++
++#define JT_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define JT_GPIO_IO(n)  (JT_GPIO_CFG(n) + 4u)
++
++static struct {
++	vm_offset_t spi;
++	vm_offset_t gpio;
++	vm_offset_t gcc;
++	uint32_t irq_status;
++	uint32_t active;
++	int x[JT_FT_MAX_FINGERS];
++	int y[JT_FT_MAX_FINGERS];
++	bool dead;
++	bool probed;
++} jt;
++
++static int jt_sleep_chan;
++
++static uint32_t
++jt_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++jt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++}
++
++static void
++jt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&jt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++jt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(jt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++jt_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out)
++{
++	uint32_t off = JT_GPIO_CFG(pin);
++	uint32_t cfg = jt_rd(jt.gpio, off);
++	if (out) {
++		/* Set the output latch before enabling output, avoiding a reset pulse. */
++		jt_wr(jt.gpio, JT_GPIO_IO(pin), jt_rd(jt.gpio, JT_GPIO_IO(pin)) | 2u);
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	jt_wr(jt.gpio, off, cfg);
++}
++
++/*
++ * Clock the SE: the GCC RCG of QUPv3 wrap2 S3 carries the route to the
++ * global serial engine. sweet needed a GCC branch vote (0x5200c); SM7125 has
++ * no such register, so only the RCG is programmed here: parent XO with HID
++ * divider 1 gives 19.2 MHz.
++ */
++static bool
++jt_clocks(void)
++{
++	uint32_t dfs = jt_rd(jt.gcc, JT_RCG + 0x14u);
++	uint32_t cfg = jt_rd(jt.gcc, JT_RCG + 4u);
++	printf("JOYEUSE TOUCH: rcg=%#x cfg=%#x dfs=%#x\n",
++	    jt_rd(jt.gcc, JT_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* SE CLK_SEL=0 selects DFS performance level 0. */
++		cfg = jt_rd(jt.gcc, JT_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("JOYEUSE TOUCH: DFS level0=%#x is not XO/1\n", cfg);
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		jt_wr(jt.gcc, JT_RCG + 4u, cfg);
++		jt_wr(jt.gcc, JT_RCG, jt_rd(jt.gcc, JT_RCG) | 1u);
++		if (!jt_wait_clear(jt.gcc, JT_RCG, 1u)) {
++			printf("JOYEUSE TOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * GENI SPI transport, FIFO mode, CPU driven. The Linux driver uses DMA for
++ * this engine, so the PIO path here is new: TX bytes are pushed into the TX
++ * FIFO, the primary sequencer is started, and the RX FIFO is drained.
++ */
++static int
++jt_spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	unsigned sent = 0, got = 0;
++	uint32_t word;
++
++	if (jt.dead || len == 0 || len > 256) {
++		return EIO;
++	}
++	if (!jt_wait_clear(jt.spi, JT_SE_STATUS, JT_SE_BUSY)) {
++		jt.dead = true;
++		return EBUSY;
++	}
++	jt_wr(jt.spi, JT_SE_IRQ_CLR, 0xffffffffu);
++
++	/* SPI parameters: 8-bit words, mode 0 (CPOL=0, CPHA=0), slave enabled. */
++	jt_wr(jt.spi, JT_SE_CPHA, 0u);
++	jt_wr(jt.spi, JT_SE_CPOL, 0u);
++	jt_wr(jt.spi, JT_SE_WORD_LEN, 7u);   /* bits - 1 */
++	jt_wr(jt.spi, JT_SE_TX_LEN, len);
++	jt_wr(jt.spi, JT_SE_RX_LEN, len);
++	jt_wr(jt.spi, JT_SE_SLAVE_EN, 1u);
++
++	/* Push the TX bytes, four per FIFO word, little endian. */
++	while (sent < len) {
++		uint32_t wc = jt_rd(jt.spi, JT_SE_TX_COUNT) & 0x07ffffffu;
++		if (wc >= 8u) {
++			delay(1);
++			continue;
++		}
++		word = 0;
++		for (unsigned i = 0; i < 4 && sent < len; ++i) {
++			word |= (uint32_t)tx[sent++] << (8u * i);
++		}
++		jt_wr(jt.spi, JT_SE_TX, word);
++	}
++
++	/* Start the primary sequencer: opcode 0 is "start transfer". */
++	jt_wr(jt.spi, JT_SE_CMD, (uint32_t)len);
++
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = jt_rd(jt.spi, JT_SE_IRQ);
++		jt.irq_status = irq;
++		if (irq & JT_SE_ERRORS) {
++			printf("JOYEUSE TOUCH: spi error irq=%#x status=%#x\n",
++			    irq, jt_rd(jt.spi, JT_SE_STATUS));
++			return (irq & JT_SE_NACK) ? ENXIO : EIO;
++		}
++		if (irq & JT_SE_DONE) {
++			break;
++		}
++		delay(1);
++	}
++	if (!(jt.irq_status & JT_SE_DONE)) {
++		printf("JOYEUSE TOUCH: spi timeout irq=%#x\n", jt.irq_status);
++		return ETIMEDOUT;
++	}
++
++	/* Drain the RX FIFO. */
++	while (got < len) {
++		uint32_t wc = jt_rd(jt.spi, JT_SE_RX_COUNT) & 0x01ffffffu;
++		if (wc == 0u) {
++			break;
++		}
++		word = jt_rd(jt.spi, JT_SE_RX);
++		for (unsigned i = 0; i < 4 && got < len; ++i) {
++			rx[got++] = (uint8_t)(word >> (8u * i));
++		}
++	}
++	jt_wr(jt.spi, JT_SE_IRQ_CLR, 0xffffffffu);
++	return got == len ? 0 : EIO;
++}
++
++/* FT8756 write: [cmd][0x00][len_hi][len_lo][0][0][0][payload] */
++static int
++jt_ft_write(uint8_t cmd, const uint8_t *payload, unsigned len)
++{
++	uint8_t buf[7 + 256];
++	uint8_t rx[7 + 256];
++	unsigned n = 7u + len;
++
++	buf[0] = cmd;
++	buf[1] = JT_FT_WRITE_CMD;
++	buf[2] = (uint8_t)(len >> 8);
++	buf[3] = (uint8_t)len;
++	buf[4] = 0u;
++	buf[5] = 0u;
++	buf[6] = 0u;
++	if (len) {
++		memcpy(&buf[7], payload, len);
++	}
++	for (unsigned attempt = 0; attempt < JT_FT_RETRY; ++attempt) {
++		int err = jt_spi_xfer(buf, rx, n);
++		if (err) {
++			continue;
++		}
++		if ((rx[3] & 0xa0u) == 0u) {
++			return 0;
++		}
++		printf("JOYEUSE TOUCH: write status %#x\n", rx[3]);
++		delay(1);
++	}
++	return EIO;
++}
++
++/* FT8756 read: [cmd][0xa0][len_hi][len_lo][0][0][0] + payload + CRC16 */
++static int
++jt_ft_read(uint8_t cmd, uint8_t *out, unsigned len)
++{
++	uint8_t buf[7 + 256 + 2];
++	uint8_t rx[7 + 256 + 2];
++	unsigned n = 7u + len + 2u;
++
++	memset(buf, 0, sizeof(buf));
++	buf[0] = cmd;
++	buf[1] = JT_FT_READ_CMD;
++	buf[2] = (uint8_t)(len >> 8);
++	buf[3] = (uint8_t)len;
++	buf[4] = 0u;
++	buf[5] = 0u;
++	buf[6] = 0u;
++
++	for (unsigned attempt = 0; attempt < JT_FT_RETRY; ++attempt) {
++		memset(rx, 0, sizeof(rx));
++		int err = jt_spi_xfer(buf, rx, n);
++		if (err) {
++			continue;
++		}
++		if ((rx[3] & 0xa0u) != 0u) {
++			printf("JOYEUSE TOUCH: read status %#x\n", rx[3]);
++			delay(1);
++			continue;
++		}
++		/* CRC16-CCITT (poly 0x8408) over the payload. */
++		uint16_t crc = 0xffffu;
++		for (unsigned i = 0; i < len; ++i) {
++			crc ^= rx[7 + i];
++			for (unsigned k = 0; k < 8; ++k) {
++				crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) :
++				    (uint16_t)(crc >> 1);
++			}
++		}
++		uint16_t got = (uint16_t)((rx[7 + len] << 8) | rx[6 + len]);
++		if (crc != got) {
++			printf("JOYEUSE TOUCH: crc %04x != %04x\n", crc, got);
++			delay(1);
++			continue;
++		}
++		memcpy(out, &rx[7], len);
++		return 0;
++	}
++	return EIO;
++}
++
++/* Report layout, as parsed by the phone's Linux driver (ft8756.c). */
++static void
++jt_report(void)
++{
++	uint8_t pt[JT_FT_REPORT_LEN];
++	uint32_t mask = 0;
++	int x[JT_FT_MAX_FINGERS] = {0};
++	int y[JT_FT_MAX_FINGERS] = {0};
++
++	if (jt_ft_read(JT_FT_REG_REPORT, pt, sizeof(pt)) != 0) {
++		return;
++	}
++	for (unsigned i = 0; i < 6; ++i) {
++		if (pt[i] != 0xefu && pt[i] != 0xffu) {
++			break;
++		}
++		/* Chip is in download/recover mode: firmware upload is missing. */
++		printf("JOYEUSE TOUCH: report carries download status\n");
++		return;
++	}
++	for (unsigned i = 0; i < JT_FT_MAX_FINGERS; ++i) {
++		unsigned base = 6u * i;
++		unsigned id = pt[base + 4] >> 4;
++		unsigned event = pt[base + 2] >> 6;
++		if (id >= JT_FT_MAX_FINGERS) {
++			continue;
++		}
++		if (event != 0u && event != 2u) {
++			continue;
++		}
++		x[id] = (int)(((pt[base + 2] & 0x0fu) << 8) | pt[base + 3]);
++		y[id] = (int)(((pt[base + 4] & 0x0fu) << 8) | pt[base + 5]);
++		mask |= 1u << id;
++	}
++	for (unsigned id = 0; id < JT_FT_MAX_FINGERS; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(jt.active & bit) || x[id] != jt.x[id] || y[id] != jt.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			jt.x[id] = x[id];
++			jt.y[id] = y[id];
++		} else if (jt.active & bit) {
++			sweet_hid_touch((int)id, 0, jt.x[id], jt.y[id]);
++		}
++	}
++	jt.active = mask;
++}
++
++static void
++jt_thread(void *arg, wait_result_t result)
++{
++	uint8_t id[2];
++	int delay_s = 5;
++	int enabled = 1;
++	int probe_only = 0;
++
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("joyeusetouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("joyeusetouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("joyeusetouchprobe", &probe_only, sizeof(probe_only));
++	if (!enabled) {
++		printf("JOYEUSE TOUCH: disabled (joyeusetouch=0)\n");
++		return;
++	}
++	if (delay_s > 0) {
++		printf("JOYEUSE TOUCH: starting in %d s\n", delay_s);
++		jt_wait((unsigned)delay_s * 1000u);
++	}
++
++	jt.spi = ml_io_map(JT_SPI_PA, 0x4000);
++	jt.gpio = ml_io_map(JT_TLMM_PA, 0x10000);
++	jt.gcc = ml_io_map(JT_GCC_PA, 0x80000);
++	if (!jt.spi || !jt.gpio || !jt.gcc) {
++		printf("JOYEUSE TOUCH: MMIO mapping failed\n");
++		return;
++	}
++	printf("JOYEUSE TOUCH: mapped spi=%#lx gpio=%#lx gcc=%#lx\n",
++	    (unsigned long)jt.spi, (unsigned long)jt.gpio, (unsigned long)jt.gcc);
++	printf("JOYEUSE TOUCH: se fw=%#x status=%#x ios=%#x\n",
++	    jt_rd(jt.spi, JT_SE_FW), jt_rd(jt.spi, JT_SE_STATUS), jt_rd(jt.spi, JT_SE_IOS));
++
++	if (!jt_clocks()) {
++		printf("JOYEUSE TOUCH: clocks not ready\n");
++		return;
++	}
++
++	/* Touch reset: gpio8 high releases the controller, low holds it. */
++	jt_gpio(JT_GPIO_RESET, 0, 3, 3, true);
++	jt_gpio(JT_GPIO_IRQ, 0, 3, 3, false);
++	jt_wait(10);
++	jt_wr(jt.gpio, JT_GPIO_IO(JT_GPIO_RESET), 1u); /* release reset */
++	jt_wait(300);
++
++	if (jt_ft_read(JT_FT_REG_ID, id, sizeof(id)) == 0) {
++		printf("JOYEUSE TOUCH: chip id %02x:%02x irq=%#x\n",
++		    id[0], id[1], jt.irq_status);
++		jt.probed = true;
++	} else {
++		printf("JOYEUSE TOUCH: chip not answering (irq=%#x status=%#x)\n",
++		    jt.irq_status, jt_rd(jt.spi, JT_SE_STATUS));
++	}
++	if (probe_only) {
++		return;
++	}
++
++	while (!jt.dead) {
++		jt_report();
++		jt_wait(10);
++	}
++	printf("JOYEUSE TOUCH: stopped\n");
++}
++
++void
++joyeuse_touch_init(void)
++{
++	thread_t thread;
++	kern_return_t kr;
++
++	kr = kernel_thread_start(jt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("JOYEUSE TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..b1ff93b 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void joyeuse_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	joyeuse_touch_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
